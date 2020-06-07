@@ -813,8 +813,10 @@ bool autoframeskip = true;
 cairo_filter_t Interpolation = CAIRO_FILTER_NEAREST;
 
 static GtkWidget *pWindow;
+static GtkWidget *pSecondWindow;
 static GtkWidget *pStatusBar;
 static GtkWidget *pDrawingArea;
+static GtkWidget *pSecondDrawingArea;
 static GtkActionGroup * action_group;
 static GtkUIManager *ui_manager;
 
@@ -902,6 +904,7 @@ static void ToggleFullscreen(GtkToggleAction *action)
   {
     GdkColor black = {0, 0, 0, 0};
     gtk_widget_modify_bg(pDrawingArea, GTK_STATE_NORMAL, &black);
+    gtk_widget_modify_bg(pSecondDrawingArea, GTK_STATE_NORMAL, &black);
 
     gtk_widget_hide(pMenuBar);
     gtk_widget_hide(pToolBar);
@@ -914,6 +917,7 @@ static void ToggleFullscreen(GtkToggleAction *action)
   else
   {
     gtk_widget_modify_bg(pDrawingArea, GTK_STATE_NORMAL, NULL);
+    gtk_widget_modify_bg(pSecondDrawingArea, GTK_STATE_NORMAL, NULL);
 
     if (config.view_menu) {
       gtk_widget_show(pMenuBar);
@@ -1492,11 +1496,44 @@ static void UpdateDrawingAreaAspect()
 	}
 }
 
+static void UpdateSecondDrawingAreaAspect()
+{
+    gint H, W;
+
+    if (nds_screen.rotation_angle == 0 || nds_screen.rotation_angle == 180) {
+        W = screen_size[nds_screen.orientation].width;
+        H = screen_size[nds_screen.orientation].height;
+    } else {
+        W = screen_size[nds_screen.orientation].height;
+        H = screen_size[nds_screen.orientation].width;
+    }
+
+    if (nds_screen.orientation != ORIENT_SINGLE) {
+        if (nds_screen.orientation == ORIENT_VERTICAL) {
+            if ((nds_screen.rotation_angle == 0 || nds_screen.rotation_angle == 180)) {
+                H += nds_screen.gap_size;
+            } else {
+                W += nds_screen.gap_size;
+            }
+        }
+    }
+
+	if (winsize_current == WINSIZE_SCALE) {
+		gtk_window_set_resizable(GTK_WINDOW(pSecondWindow), TRUE);
+		gtk_widget_set_size_request(GTK_WIDGET(pSecondDrawingArea), W, H);
+	} else {
+		gtk_window_unmaximize(GTK_WINDOW(pSecondWindow));
+		gtk_window_set_resizable(GTK_WINDOW(pSecondWindow), FALSE);
+		gtk_widget_set_size_request(GTK_WIDGET(pSecondDrawingArea), W * winsize_current / 2, H * winsize_current / 2);
+	}
+}
+
 static void ToggleGap(GtkToggleAction* action)
 {
     config.view_gap = gtk_toggle_action_get_active(action);
     nds_screen.gap_size = config.view_gap ? GAP_SIZE : 0;
     UpdateDrawingAreaAspect();
+    UpdateSecondDrawingAreaAspect();
 }
 
 static void SetRotation(GtkAction *action, GtkRadioAction *current)
@@ -1504,6 +1541,7 @@ static void SetRotation(GtkAction *action, GtkRadioAction *current)
     nds_screen.rotation_angle = gtk_radio_action_get_current_value(current);
     config.view_rot = nds_screen.rotation_angle;
     UpdateDrawingAreaAspect();
+    UpdateSecondDrawingAreaAspect();
 }
 
 static void SetWinsize(GtkAction *action, GtkRadioAction *current)
@@ -1515,6 +1553,7 @@ static void SetWinsize(GtkAction *action, GtkRadioAction *current)
 	}
 	gtk_action_set_sensitive(gtk_action_group_get_action(action_group, "fullscreen"), winsize_current == WINSIZE_SCALE);
 	UpdateDrawingAreaAspect();
+	UpdateSecondDrawingAreaAspect();
 }
 
 static void SetOrientation(GtkAction *action, GtkRadioAction *current)
@@ -1525,6 +1564,7 @@ static void SetOrientation(GtkAction *action, GtkRadioAction *current)
 #endif
     config.view_orient = nds_screen.orientation;
     UpdateDrawingAreaAspect();
+    UpdateSecondDrawingAreaAspect();
 }
 
 static void ToggleSwapScreens(GtkToggleAction *action) {
@@ -1667,6 +1707,70 @@ static gboolean ExposeDrawingArea (GtkWidget *widget, GdkEventExpose *event, gpo
 	return TRUE;
 }
 
+static gboolean ExposeSecondDrawingArea (GtkWidget *widget, GdkEventExpose *event, gpointer data)
+{
+	GdkWindow* window = gtk_widget_get_window(widget);
+	gint daW, daH;
+#if GTK_CHECK_VERSION(2,24,0)
+	daW = gdk_window_get_width(window);
+	daH = gdk_window_get_height(window);
+#else
+	gdk_drawable_get_size(window, &daW, &daH);
+#endif
+	u32* fbuf = video->GetDstBufferPtr();
+	gint dstW = video->GetDstWidth();
+	gint dstH = video->GetDstHeight();
+
+	gint dstScale = dstW * 2 / 256; // Actual scale * 2 to handle 1.5x filters
+	
+	gint gap = nds_screen.orientation == ORIENT_VERTICAL ? nds_screen.gap_size * dstScale / 2 : 0;
+	gint imgW, imgH;
+	if (nds_screen.rotation_angle == 0 || nds_screen.rotation_angle == 180) {
+		imgW = screen_size[nds_screen.orientation].width * dstScale / 2;
+		imgH = screen_size[nds_screen.orientation].height * dstScale / 2 + gap;
+	} else {
+		imgH = screen_size[nds_screen.orientation].width * dstScale / 2;
+		imgW = screen_size[nds_screen.orientation].height * dstScale / 2 + gap;
+	}
+
+	// Calculate scale to fit display area to window
+	gfloat hratio = (gfloat)daW / (gfloat)imgW;
+	gfloat vratio = (gfloat)daH / (gfloat)imgH;
+	hratio = MIN(hratio, vratio);
+	vratio = hratio;
+
+	cairo_t* cr = gdk_cairo_create(window);
+
+	// Scale to window size at center of area
+	cairo_translate(cr, daW / 2, daH / 2);
+	cairo_scale(cr, hratio, vratio);
+	// Rotate area
+	cairo_rotate(cr, M_PI / 180 * nds_screen.rotation_angle);
+	// Translate area to top-left corner
+	if (nds_screen.rotation_angle == 0 || nds_screen.rotation_angle == 180) {
+		cairo_translate(cr, -imgW / 2, -imgH / 2);
+	} else {
+		cairo_translate(cr, -imgH / 2, -imgW / 2);
+	}
+	// Draw both screens
+	drawTopScreen(cr, fbuf, dstW, dstH / 2, gap, nds_screen.rotation_angle, !nds_screen.swap, nds_screen.orientation);
+	drawBottomScreen(cr, fbuf + dstW * dstH / 2, dstW, dstH / 2, gap, nds_screen.rotation_angle, !nds_screen.swap, nds_screen.orientation);
+	// Draw gap
+	cairo_set_source_rgb(cr, 0.3, 0.3, 0.3);
+	cairo_rectangle(cr, 0, dstH / 2, dstW, gap);
+	cairo_fill(cr);
+	// Complete the touch transformation matrix
+	cairo_matrix_scale(&nds_screen.topscreen_matrix, (double)dstScale / 2, (double)dstScale / 2);
+	cairo_matrix_invert(&nds_screen.topscreen_matrix);
+	cairo_matrix_scale(&nds_screen.touch_matrix, (double)dstScale / 2, (double)dstScale / 2);
+	cairo_matrix_invert(&nds_screen.touch_matrix);
+
+	cairo_destroy(cr);
+	draw_count++;
+
+	return TRUE;
+}
+
 static void RedrawScreen() {
 	ColorspaceConvertBuffer555To8888Opaque<true, false>((const uint16_t *)GPU->GetDisplayInfo().masterNativeBuffer, (uint32_t *)video->GetSrcBufferPtr(), GPU_FRAMEBUFFER_NATIVE_WIDTH * GPU_FRAMEBUFFER_NATIVE_HEIGHT * 2);
 #ifdef HAVE_LIBAGG
@@ -1677,6 +1781,7 @@ static void RedrawScreen() {
 #endif
 	video->RunFilter();
 	gtk_widget_queue_draw(pDrawingArea);
+	gtk_widget_queue_draw(pSecondDrawingArea);
 }
 
 /////////////////////////////// KEYS AND STYLUS UPDATE ///////////////////////////////////////
@@ -3126,6 +3231,8 @@ common_gtk_main( class configured_features *my_config)
     GtkWidget *pVBox;
     GtkWidget *pMenuBar;
     GtkWidget *pToolBar;
+    
+    GtkWidget *pSecondVBox;
 
     /* use any language set on the command line */
     if ( my_config->firmware_language != -1) {
@@ -3273,10 +3380,18 @@ common_gtk_main( class configured_features *my_config)
     g_signal_connect(G_OBJECT(pWindow), "destroy", G_CALLBACK(DoQuit), NULL);
     g_signal_connect(G_OBJECT(pWindow), "key_press_event", G_CALLBACK(Key_Press), NULL);
     g_signal_connect(G_OBJECT(pWindow), "key_release_event", G_CALLBACK(Key_Release), NULL);
+    
+    /* Create the second window */
+    pSecondWindow = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_resizable(GTK_WINDOW(pSecondWindow), TRUE);
+    gtk_window_set_deletable(GTK_WINDOW(pSecondWindow), FALSE);
 
     /* Create the GtkVBox */
     pVBox = gtk_vbox_new(FALSE, 0);
     gtk_container_add(GTK_CONTAINER(pWindow), pVBox);
+    
+    pSecondVBox = gtk_vbox_new(FALSE, 0);
+    gtk_container_add(GTK_CONTAINER(pSecondWindow), pSecondVBox);
 
     ui_manager = gtk_ui_manager_new ();
     accel_group = gtk_accel_group_new();
@@ -3421,11 +3536,13 @@ common_gtk_main( class configured_features *my_config)
 
     /* Creating the place for showing DS screens */
     pDrawingArea = gtk_drawing_area_new();
+    pSecondDrawingArea = gtk_drawing_area_new();
 
     /* This toggle action must not be set active before the pDrawingArea initialization to avoid a GTK warning */
     gtk_toggle_action_set_active((GtkToggleAction*)gtk_action_group_get_action(action_group, "gap"), config.view_gap);
 
     gtk_container_add (GTK_CONTAINER (pVBox), pDrawingArea);
+    gtk_container_add (GTK_CONTAINER (pSecondVBox), pSecondDrawingArea);
 
     gtk_widget_set_events(pDrawingArea,
                           GDK_EXPOSURE_MASK | GDK_LEAVE_NOTIFY_MASK |
@@ -3442,6 +3559,12 @@ common_gtk_main( class configured_features *my_config)
                      G_CALLBACK(ExposeDrawingArea), NULL ) ;
     g_signal_connect(G_OBJECT(pDrawingArea), "configure_event",
                      G_CALLBACK(ConfigureDrawingArea), NULL ) ;
+                     
+    gtk_widget_set_events(pSecondDrawingArea, GDK_EXPOSURE_MASK);
+    g_signal_connect(G_OBJECT(pSecondDrawingArea), "expose_event",
+                     G_CALLBACK(ExposeSecondDrawingArea), NULL ) ;
+    g_signal_connect(G_OBJECT(pSecondDrawingArea), "configure_event",
+                     G_CALLBACK(ConfigureDrawingArea), NULL ) ;
 
     /* Status bar */
     pStatusBar = gtk_statusbar_new();
@@ -3449,6 +3572,7 @@ common_gtk_main( class configured_features *my_config)
     gtk_box_pack_end(GTK_BOX(pVBox), pStatusBar, FALSE, FALSE, 0);
 
     gtk_widget_show_all(pWindow);
+    gtk_widget_show_all(pSecondWindow);
 
 	if (winsize_current == WINSIZE_SCALE) {
 		if (config.window_fullscreen) {
@@ -3477,6 +3601,7 @@ common_gtk_main( class configured_features *my_config)
 		gtk_toggle_action_set_active((GtkToggleAction*)gtk_action_group_get_action(action_group, "view_statusbar"), FALSE);
 	}
     UpdateDrawingAreaAspect();
+    UpdateSecondDrawingAreaAspect();
 
     if (my_config->disable_limiter || !config.fpslimiter) {
         config.fpslimiter = false;
